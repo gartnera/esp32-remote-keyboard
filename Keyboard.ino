@@ -7,12 +7,16 @@
 #include "Arduino.h"
 #include "USB.h"
 #include "USBHIDKeyboard.h"
+#include "USBHIDGamepad.h"
 #include "esp32-hal-tinyusb.h"
 #include <WebSocketsServer.h>
 #include <ArduinoJson.h>
 USBHIDKeyboard Keyboard;
+USBHIDGamepad Gamepad;
 
 bool keyboardIsInit = false;
+bool gamepadIsInit = false;
+bool usbIsInit = false;
 
 // TCP server at port 80 will respond to HTTP requests
 WiFiServer httpServer(80);
@@ -27,9 +31,26 @@ void maybeInitKeyboard()
   {
     return;
   }
+  if (!usbIsInit) {
+    USB.begin();
+    usbIsInit = true;
+  }
   Keyboard.begin();
-  USB.begin();
   keyboardIsInit = true;
+}
+
+void maybeInitGamepad()
+{
+  if (gamepadIsInit)
+  {
+    return;
+  }
+  if (!usbIsInit) {
+    USB.begin();
+    usbIsInit = true;
+  }
+  Gamepad.begin();
+  gamepadIsInit = true;
 }
 
 void processCmdRemoteDebug()
@@ -62,6 +83,16 @@ void processCmdRemoteDebug()
   else if (cmd == "keyboardinit")
   {
     maybeInitKeyboard();
+  }
+  else if (cmd == "gamepadinit")
+  {
+    maybeInitGamepad();
+    Gamepad.pressButton(BUTTON_A);
+    Gamepad.releaseButton(BUTTON_A);
+    Gamepad.leftStick(10, 10);
+    Gamepad.rightStick(128, -128);
+    Gamepad.leftTrigger(0);
+    Gamepad.rightTrigger(0);
   }
   else if (cmd == "keyboard")
   {
@@ -109,7 +140,7 @@ void setup(void)
   //   the fully-qualified domain name is "esp32.local"
   // - second argument is the IP address to advertise
   //   we send our IP address on the WiFi network
-  if (!MDNS.begin("esp32"))
+  if (!MDNS.begin("esp32-dev"))
   {
     Serial.println("Error setting up MDNS responder!");
     while (1)
@@ -186,14 +217,64 @@ void handleHttpClient()
   Debug.println("Done with client");
 }
 
-StaticJsonDocument<200> doc;
+StaticJsonDocument<512> doc;
+
+void handleKeyMsg() {
+  maybeInitKeyboard();
+  int keyCode;
+  JsonArray modifiers;
+  uint8_t modifier;
+  keyCode = doc["keyCode"].as<uint8_t>();
+  debugD("got keyCode: %d", keyCode);
+  modifiers = doc["modifiers"].as<JsonArray>();
+  for (JsonVariant v : modifiers)
+  {
+    modifier = v.as<uint8_t>();
+    debugD("got modifier: %d", modifier);
+    Keyboard.pressRaw(modifier);
+  }
+  Keyboard.pressRaw(keyCode);
+  Keyboard.releaseAll();
+}
+
+void handleGamepadMsg() {
+  int8_t x;
+  int8_t y;
+  int8_t z;
+  int8_t rz;
+  int8_t rx;
+  int8_t ry;
+  uint8_t hat;
+  uint32_t buttons;
+
+  uint8_t button;
+
+  JsonArray rawButtons;
+
+  maybeInitGamepad();
+  x = doc["x"].as<int8_t>();
+  y = doc["y"].as<int8_t>();
+  z = doc["z"].as<int8_t>();
+  rz = doc["rz"].as<int8_t>();
+  rx = doc["rx"].as<int8_t>();
+  ry = doc["ry"].as<int8_t>();
+  hat = doc["hat"].as<uint8_t>();
+  rawButtons = doc["buttons"].as<JsonArray>();
+  for (JsonVariant v : rawButtons)
+  {
+    button = v.as<uint8_t>();
+    buttons |= (1 << button);
+  }
+
+  debugD("got gamepad: x %d y %d z %d rz %d rx %d ry %d", x, y, z, rz, rx, ry);
+  Gamepad.send(x, y, z, rz, rx, ry, hat, buttons);
+}
 
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
 {
   DeserializationError error;
-  int keyCode;
-  JsonArray modifiers;
-  uint8_t modifier;
+
+  String msgType;
 
   switch (type)
   {
@@ -204,8 +285,6 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
   {
     IPAddress ip = webSocket.remoteIP(num);
     Debug.printf("[%u] Connected from %d.%d.%d.%d url: %s\n", num, ip[0], ip[1], ip[2], ip[3], payload);
-
-    maybeInitKeyboard();
 
     // send message to client
     webSocket.sendTXT(num, "Connected");
@@ -222,17 +301,14 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
       Debug.println(error.f_str());
       return;
     }
-    keyCode = doc["keyCode"].as<uint8_t>();
-    debugD("got keyCode: %d", keyCode);
-    modifiers = doc["modifiers"].as<JsonArray>();
-    for (JsonVariant v : modifiers)
-    {
-      modifier = v.as<uint8_t>();
-      debugD("got modifier: %d", modifier);
-      Keyboard.pressRaw(modifier);
+    msgType = doc["type"].as<String>();
+    debugD("got message type: %s", msgType);
+    // keyboard is default type to tolerate old firmwares
+    if (msgType == "null" || msgType == "keyboard") {
+      handleKeyMsg();
+    } else if (msgType == "gamepad") {
+      handleGamepadMsg();
     }
-    Keyboard.pressRaw(keyCode);
-    Keyboard.releaseAll();
     break;
   case WStype_ERROR:
   case WStype_FRAGMENT_TEXT_START:
