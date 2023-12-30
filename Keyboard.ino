@@ -21,6 +21,8 @@ bool usbIsInit = false;
 // TCP server at port 80 will respond to HTTP requests
 WiFiServer httpServer(80);
 
+WiFiUDP udp;
+
 WebSocketsServer webSocket = WebSocketsServer(81);
 
 RemoteDebug Debug;
@@ -31,7 +33,8 @@ void maybeInitKeyboard()
   {
     return;
   }
-  if (!usbIsInit) {
+  if (!usbIsInit)
+  {
     USB.begin();
     usbIsInit = true;
   }
@@ -45,7 +48,8 @@ void maybeInitGamepad()
   {
     return;
   }
-  if (!usbIsInit) {
+  if (!usbIsInit)
+  {
     USB.begin();
     usbIsInit = true;
   }
@@ -140,7 +144,7 @@ void setup(void)
   //   the fully-qualified domain name is "esp32.local"
   // - second argument is the IP address to advertise
   //   we send our IP address on the WiFi network
-  if (!MDNS.begin("esp32-dev"))
+  if (!MDNS.begin("esp32"))
   {
     Serial.println("Error setting up MDNS responder!");
     while (1)
@@ -159,6 +163,8 @@ void setup(void)
 
   // Add service to MDNS-SD
   MDNS.addService("http", "tcp", 80);
+
+  udp.begin(9876);
 }
 
 void handleHttpClient()
@@ -219,7 +225,8 @@ void handleHttpClient()
 
 StaticJsonDocument<512> doc;
 
-void handleKeyMsg() {
+void handleKeyMsg()
+{
   maybeInitKeyboard();
   int keyCode;
   JsonArray modifiers;
@@ -237,7 +244,9 @@ void handleKeyMsg() {
   Keyboard.releaseAll();
 }
 
-void handleGamepadMsg() {
+
+void handleGamepadMsg()
+{
   int8_t x;
   int8_t y;
   int8_t z;
@@ -270,12 +279,35 @@ void handleGamepadMsg() {
   Gamepad.send(x, y, z, rz, rx, ry, hat, buttons);
 }
 
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
+void handleMessage(uint8_t num, uint8_t *message)
 {
   DeserializationError error;
-
   String msgType;
+  debugD("[%u] get Text: %s", num, message);
+  error = deserializeJson(doc, message);
 
+  // Test if parsing succeeds.
+  if (error)
+  {
+    Debug.print(F("deserializeJson() failed: "));
+    Debug.println(error.f_str());
+    return;
+  }
+  msgType = doc["type"].as<String>();
+  debugD("got message type: %s", msgType);
+  // keyboard is default type to tolerate old firmwares
+  if (msgType == "null" || msgType == "keyboard")
+  {
+    handleKeyMsg();
+  }
+  else if (msgType == "gamepad")
+  {
+    handleGamepadMsg();
+  }
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
+{
   switch (type)
   {
   case WStype_DISCONNECTED:
@@ -290,25 +322,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
     webSocket.sendTXT(num, "Connected");
   }
   break;
+  case WStype_BIN:
   case WStype_TEXT:
-    debugD("[%u] get Text: %s", num, payload);
-    error = deserializeJson(doc, payload);
-
-    // Test if parsing succeeds.
-    if (error)
-    {
-      Debug.print(F("deserializeJson() failed: "));
-      Debug.println(error.f_str());
-      return;
-    }
-    msgType = doc["type"].as<String>();
-    debugD("got message type: %s", msgType);
-    // keyboard is default type to tolerate old firmwares
-    if (msgType == "null" || msgType == "keyboard") {
-      handleKeyMsg();
-    } else if (msgType == "gamepad") {
-      handleGamepadMsg();
-    }
+    handleMessage(num, payload);
     break;
   case WStype_ERROR:
   case WStype_FRAGMENT_TEXT_START:
@@ -320,10 +336,30 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
   }
 }
 
+uint8_t buffer[256];
+
+void handleUdp()
+{
+  bool hasPacket = false;
+  // ensure we are fully drained every tick
+  while(udp.parsePacket()) {
+    if (hasPacket) {
+      debugD("dropping extra udp packet");
+    }
+    hasPacket = true;
+    udp.read(buffer, 255);
+  }
+  if (!hasPacket) {
+    return;
+  }
+  handleMessage(udp.remotePort(), buffer);
+}
+
 void loop(void)
 {
   handleHttpClient();
   Debug.handle();
   webSocket.loop();
+  handleUdp();
   yield();
 }
